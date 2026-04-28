@@ -113,6 +113,28 @@ def upsert_daily_bars(conn: sqlite3.Connection, rows: Iterable[tuple]) -> None:
     conn.commit()
 
 
+def get_latest_market_caps(conn: sqlite3.Connection, symbols: Iterable[str]) -> dict[str, tuple[str, float]]:
+    symbols_list = [sym for sym in symbols if sym]
+    if not symbols_list:
+        return {}
+
+    placeholders = ",".join("?" for _ in symbols_list)
+    query = f"""
+        SELECT mcs.symbol, mcs.snapshot_date, mcs.market_cap_inr
+        FROM market_cap_snapshot mcs
+        JOIN (
+            SELECT symbol, MAX(snapshot_date) AS max_snapshot_date
+            FROM market_cap_snapshot
+            WHERE symbol IN ({placeholders})
+            GROUP BY symbol
+        ) latest
+            ON latest.symbol = mcs.symbol
+           AND latest.max_snapshot_date = mcs.snapshot_date
+    """
+    rows = conn.execute(query, symbols_list).fetchall()
+    return {symbol: (snapshot_date, market_cap) for symbol, snapshot_date, market_cap in rows}
+
+
 def get_latest_trade_date(conn: sqlite3.Connection, symbol: str) -> str | None:
     row = conn.execute(
         "SELECT MAX(trade_date) FROM daily_bars WHERE symbol = ?",

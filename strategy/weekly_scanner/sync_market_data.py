@@ -15,6 +15,7 @@ from data_store import (
     DB_PATH,
     PROJECT_ROOT,
     get_connection,
+    get_latest_market_caps,
     get_latest_trade_date,
     init_schema,
     mark_all_symbols_inactive,
@@ -32,7 +33,8 @@ API_SLEEP_SECONDS = 0.2
 NSE_HOME = "https://www.nseindia.com"
 NSE_EQ_LIST_URL = "https://nsearchives.nseindia.com/content/indices/ind_niftymidsmallcap400list.csv"
 MARKET_CAP_CSV_PATH = PROJECT_ROOT / "data" / "market_cap_snapshot.csv"
-MAX_HISTORY_WINDOW_DAYS = 365
+MAX_HISTORY_WINDOW_DAYS = 365*3
+MARKET_CAP_STALENESS_DAYS = 30
 
 
 @dataclass
@@ -79,18 +81,58 @@ def fetch_symbols_from_nse(session: requests.Session) -> list[SymbolRecord]:
 
 
 def load_market_cap_snapshot(symbols: list[SymbolRecord]) -> dict[str, float]:
-
     market_caps: dict[str, float] = {}
-    for symbolRecord in symbols:
-        symbol = symbolRecord.symbol
-        symbolNS = symbol + ".NS"
-        stock = yf.Ticker(symbolNS)
+    for symbol_record in symbols:
+        symbol = symbol_record.symbol
+        symbol_ns = symbol + ".NS"
+        stock = yf.Ticker(symbol_ns)
         market_cap = stock.info.get("marketCap")
         if market_cap is None:
             continue
         market_caps[symbol] = market_cap
         time.sleep(API_SLEEP_SECONDS)
     return market_caps
+
+
+def _is_snapshot_stale(snapshot_date: str, threshold_date: datetime.date) -> bool:
+    try:
+        snapshot_dt = datetime.strptime(snapshot_date, "%Y-%m-%d").date()
+    except ValueError:
+        return True
+    return snapshot_dt < threshold_date
+
+
+def resolve_market_caps(
+    conn,
+    symbols: list[SymbolRecord],
+    today: datetime.date,
+) -> tuple[dict[str, float], list[tuple[str, str, float, str]], int]:
+    latest_caps = get_latest_market_caps(conn, (record.symbol for record in symbols))
+    threshold_date = today - timedelta(days=MARKET_CAP_STALENESS_DAYS)
+
+    symbols_to_refresh: list[SymbolRecord] = []
+    market_caps: dict[str, float] = {}
+    for record in symbols:
+        latest = latest_caps.get(record.symbol)
+        if latest is None:
+            symbols_to_refresh.append(record)
+            continue
+
+        snapshot_date, cached_cap = latest
+        if _is_snapshot_stale(snapshot_date=snapshot_date, threshold_date=threshold_date):
+            symbols_to_refresh.append(record)
+            continue
+        market_caps[record.symbol] = cached_cap
+
+    refreshed_caps = load_market_cap_snapshot(symbols_to_refresh) if symbols_to_refresh else {}
+    market_caps.update(refreshed_caps)
+
+    snapshot_date = today.strftime("%Y-%m-%d")
+    cap_rows = [
+        (symbol, snapshot_date, cap, "yfinance")
+        for symbol, cap in refreshed_caps.items()
+    ]
+    return market_caps, cap_rows, len(symbols_to_refresh)
 
 
 def eligible_symbols(symbols: Iterable[SymbolRecord], market_caps: dict[str, float]) -> list[SymbolRecord]:
@@ -168,13 +210,18 @@ def _to_float(value: object) -> float | None:
 def main() -> None:
     session = _nse_session()
     all_symbols = fetch_symbols_from_nse(session)
-    market_caps = load_market_cap_snapshot(all_symbols)
-    eligible = eligible_symbols(all_symbols, market_caps)
-
-    snapshot_date = datetime.now().strftime("%Y-%m-%d")
+    today = datetime.now().date()
+    snapshot_date = today.strftime("%Y-%m-%d")
     with get_connection(DB_PATH) as conn:
         init_schema(conn)
         mark_all_symbols_inactive(conn)
+
+        market_caps, cap_rows, refreshed_count = resolve_market_caps(
+            conn=conn,
+            symbols=all_symbols,
+            today=today,
+        )
+        eligible = eligible_symbols(all_symbols, market_caps)
 
         symbol_rows = [
             (s.symbol, s.company_name, s.industry, snapshot_date, snapshot_date)
@@ -182,11 +229,8 @@ def main() -> None:
         ]
         upsert_symbols(conn, symbol_rows)
 
-        cap_rows = [
-            (sym, snapshot_date, cap, "csv_snapshot")
-            for sym, cap in market_caps.items()
-        ]
-        upsert_market_caps(conn, cap_rows)
+        if cap_rows:
+            upsert_market_caps(conn, cap_rows)
 
         for i in range(0, len(eligible), BATCH_SIZE):
             batch = eligible[i : i + BATCH_SIZE]
@@ -212,6 +256,7 @@ def main() -> None:
 
     print("Local datastore sync complete.")
     print(f"Total symbols snapshot: {len(all_symbols)}")
+    print(f"Market-cap refreshed symbols (> {MARKET_CAP_STALENESS_DAYS} days old): {refreshed_count}")
     print(f"Eligible symbols by market cap: {len(eligible)}")
     print(f"Database path: {DB_PATH}")
     print(f"Market-cap source CSV: {MARKET_CAP_CSV_PATH}")
