@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import pandas as pd
+import pandas_ta as ta
 
 from data_store import DB_PATH, get_connection
 
@@ -8,8 +9,10 @@ from data_store import DB_PATH, get_connection
 DEFAULT_OUTPUT_FILE = "weekly_analysis.xlsx"
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 OUTPUT_DIR = PROJECT_ROOT / "output_files"
-SCREEN_THRESHOLD_RATIO = 0.9
+SCREEN_THRESHOLD_RATIO = 0.90
 SCREEN_SHEET_NAME = "screened_stocks"
+SQUEEZE_MODE = "weekly"
+SQUEEZE_MIN_HISTORY = 30
 
 
 def scan_stocks() -> pd.DataFrame:
@@ -71,6 +74,10 @@ def scan_stocks() -> pd.DataFrame:
     if data.empty:
         return data
 
+    data = _apply_squeeze_filter(data)
+    if data.empty:
+        return data
+
     data["pct_below_ath"] = ((data["all_time_high"] - data["latest_close"]) / data["all_time_high"]) * 100
     data["ath_category"] = "recent_ath"
     data.loc[data["days_since_ath"] >= 50, "ath_category"] = "midrange_ath"
@@ -87,6 +94,121 @@ def scan_stocks() -> pd.DataFrame:
     data["all_time_high"] = data["all_time_high"].round(2)
     data["pct_below_ath"] = data["pct_below_ath"].round(2)
     return data
+
+
+def _apply_squeeze_filter(scan_df: pd.DataFrame) -> pd.DataFrame:
+    if SQUEEZE_MODE == "weekly":
+        return _filter_weekly_squeeze_candidates(scan_df)
+    return _filter_squeeze_candidates(scan_df)
+
+
+def _load_symbol_history(conn, symbol: str) -> pd.DataFrame:
+    history_df = pd.read_sql_query(
+        """
+        SELECT trade_date, open, high, low, close, volume
+        FROM daily_bars
+        WHERE symbol = ?
+        ORDER BY trade_date
+        """,
+        conn,
+        params=(symbol,),
+    )
+    if history_df.empty:
+        return history_df
+
+    history_df["trade_date"] = pd.to_datetime(history_df["trade_date"])
+    return history_df
+
+
+def _extract_latest_squeeze_info(price_df: pd.DataFrame) -> dict[str, object] | None:
+    if len(price_df) < SQUEEZE_MIN_HISTORY:
+        return None
+
+    squeeze_df = ta.squeeze(
+        high=price_df["high"],
+        low=price_df["low"],
+        close=price_df["close"],
+        asint=True,
+    )
+    if squeeze_df is None or squeeze_df.empty or "SQZ_ON" not in squeeze_df.columns:
+        return None
+
+    latest_sqz_on = squeeze_df["SQZ_ON"].iloc[-1]
+    if int(latest_sqz_on) != 1:
+        return None
+
+    squeeze_value_col = next(
+        (
+            column
+            for column in squeeze_df.columns
+            if column.startswith("SQZ") and column not in {"SQZ_ON", "SQZ_OFF", "SQZ_NO"}
+        ),
+        None,
+    )
+    return {
+        "sqz_on": int(latest_sqz_on),
+        "sqz_value": float(squeeze_df[squeeze_value_col].iloc[-1]) if squeeze_value_col else None,
+    }
+
+
+def _filter_squeeze_candidates(scan_df: pd.DataFrame) -> pd.DataFrame:
+    symbols = scan_df["symbol"].dropna().tolist()
+    squeeze_rows: list[dict[str, object]] = []
+
+    with get_connection(DB_PATH) as conn:
+        for symbol in symbols:
+            history_df = _load_symbol_history(conn, symbol)
+            squeeze_info = _extract_latest_squeeze_info(history_df)
+            if squeeze_info is None:
+                continue
+
+            squeeze_rows.append({"symbol": symbol, "squeeze_timeframe": "daily", **squeeze_info})
+
+    if not squeeze_rows:
+        return scan_df.iloc[0:0].copy()
+
+    squeeze_flags_df = pd.DataFrame(squeeze_rows)
+    merged = scan_df.merge(squeeze_flags_df, on="symbol", how="inner")
+    return merged
+
+
+def _filter_weekly_squeeze_candidates(scan_df: pd.DataFrame) -> pd.DataFrame:
+    symbols = scan_df["symbol"].dropna().tolist()
+    squeeze_rows: list[dict[str, object]] = []
+
+    with get_connection(DB_PATH) as conn:
+        for symbol in symbols:
+            history_df = _load_symbol_history(conn, symbol)
+            if history_df.empty:
+                continue
+
+            weekly_df = (
+                history_df.set_index("trade_date")
+                .resample("W-FRI")
+                .agg(
+                    {
+                        "open": "first",
+                        "high": "max",
+                        "low": "min",
+                        "close": "last",
+                        "volume": "sum",
+                    }
+                )
+                .dropna(subset=["open", "high", "low", "close"])
+                .reset_index()
+            )
+            squeeze_info = _extract_latest_squeeze_info(weekly_df)
+            if squeeze_info is None:
+                continue
+
+            squeeze_rows.append({"symbol": symbol, "squeeze_timeframe": "weekly", **squeeze_info})
+
+    if not squeeze_rows:
+        return scan_df.iloc[0:0].copy()
+
+    squeeze_flags_df = pd.DataFrame(squeeze_rows)
+    merged = scan_df.merge(squeeze_flags_df, on="symbol", how="inner")
+    return merged
 
 
 def save_scan(output_path: Path, scan_df: pd.DataFrame) -> None:
